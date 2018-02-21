@@ -1,1 +1,1 @@
-# NCAA_W
+# NCAA
