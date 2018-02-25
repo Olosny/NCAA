@@ -1,10 +1,14 @@
+# todo : inclue Home/Visitor in model
+#        refactor stats extractions -> put all team stats in teams then merge
+
 #%%
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.utils import shuffle
 from sklearn.model_selection import GridSearchCV
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LogisticRegression, Ridge
+
 
 # --------------------------------- Load data ---------------------------------
 cities = pd.read_csv('./data_w/WCities.csv')
@@ -17,6 +21,11 @@ seasons = pd.read_csv('./data_w/WSeasons.csv')
 teamspellings = pd.read_csv('./data_w/WTeamSpellings.csv', engine='python')
 teams = pd.read_csv('./data_w/WTeams.csv')
 sub = pd.read_csv('./data_w/WSampleSubmissionStage1.csv')
+
+
+# ----------------------------- Validation metric -----------------------------
+def val_score(y_true, y_pred):
+    return -(y_true*np.log(y_pred)+(1-y_true)*np.log(1-y_pred)).mean()
 
 
 # --------------------------------- Formating ---------------------------------
@@ -78,6 +87,7 @@ pts.drop(['T1PtsSc','T1PtsTk','T2PtsSc','T2PtsTk','T1ct','T2ct','T1Wins','T2Wins
 
 t1pts = pts.rename(columns={'TeamID':'T1ID', 'MPtsSc':'T1MPtsSc', 'MPtsTk':'T1MPtsTk', 'Wratio':'T1Wratio', 'Wdelta':'T1Wdelta'})
 t2pts = pts.rename(columns={'TeamID':'T2ID', 'MPtsSc':'T2MPtsSc', 'MPtsTk':'T2MPtsTk', 'Wratio':'T2Wratio', 'Wdelta':'T2Wdelta'})
+
 regseason = pd.merge(left=regseason, right=t1pts, how='left', on=['Season', 'T1ID'])
 regseason = pd.merge(left=regseason, right=t2pts, how='left', on=['Season', 'T2ID'])
 
@@ -94,70 +104,41 @@ tourney['MPtsTkDiff'] = tourney['T1MPtsTk'] - tourney['T2MPtsTk']
 tourney['WratioDiff'] = tourney['T1Wratio'] - tourney['T2Wratio']
 tourney['WdeltaDiff'] = tourney['T1Wdelta'] - tourney['T2Wdelta']
 
-print(tourney.describe())
 
-# ----------------------------- Validation metric -----------------------------
-def val_score(y_pred, y_true):
-    return -(y_true*np.log(y_pred)+(1-y_true)*np.log(1-y_pred)).mean()
+#%% --------------------------------- Obs -------------------------------------
+tourney.plot(x='SeedDiff', y='Result', kind='scatter')
+plt.show()
 
-
-# --------------------------------- 1st model ---------------------------------
-# tourney based only. based on seed diff
-print("Tourney seeds based model")
-
-data = tourney.loc[:,['Season','T1ID','T2ID','SeedDiff','Result']]
-train1 = data.loc[:,['Season','SeedDiff','Result']]
-train2 = data.loc[:,['Season','SeedDiff','Result']]
-train2['SeedDiff'] *= -1
-train2['Result'] = 1 - train2['Result']
-full_train = pd.concat([train1, train2]).reset_index(drop=True)
-full_test = data[(data['Season']>=2014) & (data['Season']<=2017)]
-
-# test each season based on other seasons
-vals = []
-years = [2014,2015,2016,2017]
-for year in years:
-    train = full_train[full_train['Season']!=year]
-    
-    X_train = train[['SeedDiff']]
-    y_train = train['Result']
-    X_train, y_train = shuffle(X_train, y_train) 
-    
-    test = full_test[full_test['Season']==year]
-    X_test = test[['SeedDiff']]
-    y_test = test['Result']
-
-    logreg = LogisticRegression()
-    params = {'C': np.logspace(start=-5, stop=3, num=9)}
-    clf = GridSearchCV(logreg, params, cv=10, scoring='neg_log_loss', refit=True)
-    clf.fit(X_train, y_train)
-
-    y_pred = clf.predict_proba(X_test)[:,1]
-    print("["+str(year)+"] score:", val_score(y_pred,y_test))
-    vals.append(val_score(y_pred,y_test))
-print("[All] score:", 1/4*sum(vals))
+from sklearn.decomposition import PCA
+pca = PCA(n_components=2)
+X = tourney[['MPtsScDiff','MPtsTkDiff','WratioDiff','WdeltaDiff']]
+y = tourney['Result']
+X_r = pca.fit_transform(X)
+for color, i, target_name in zip(['green','red'], [0, 1], ['win','loss']):
+    plt.scatter(X_r[y == i, 0], X_r[y == i, 1], color=color, label=target_name)
+plt.legend(loc='best', shadow=False, scatterpoints=1)
+plt.title('PCA')
+plt.figure()  # Lot of 50/50
 
 
-# --------------------------------- 2nd model ---------------------------------
-# based on prev regular season. Pts scored/taken diff, winrate diff
+# ----------------------------------- Model -----------------------------------
+#%% based on prev regular season + seed diff. Pts scored/taken diff, winrate diff
 print("Reg season stats based model")
 
-data = tourney.loc[:,['Season','T1ID','T2ID','MPtsScDiff','MPtsTkDiff','WratioDiff','WdeltaDiff','Result']]
-train1 = data.loc[:,['Season','MPtsScDiff','MPtsTkDiff','WratioDiff','WdeltaDiff','Result']]
-train2 = data.loc[:,['Season','MPtsScDiff','MPtsTkDiff','WratioDiff','WdeltaDiff','Result']]
-train2['MPtsScDiff'] *= -1
-train2['MPtsTkDiff'] *= -1
-train2['WratioDiff'] *= -1
-train2['WdeltaDiff'] *= -1
+features = ['MPtsScDiff','MPtsTkDiff','WratioDiff','SeedDiff']   # Best #
+#features = ['MPtsScDiff','MPtsTkDiff','WdeltaDiff','SeedDiff']
+#features = ['MPtsScDiff','MPtsTkDiff','SeedDiff']
+#features = ['WratioDiff']
+#features = ['WdeltaDiff']
+
+data = tourney.loc[:,['Season','T1ID','T2ID','Result']+features]
+train1 = data.loc[:,['Season','Result']+features]
+train2 = data.loc[:,['Season','Result']+features]
+for feature in features:
+    train2[feature] *= -1
 train2['Result'] = 1 - train2['Result']
 full_train = pd.concat([train1, train2]).reset_index(drop=True)
 full_test = data[(data['Season']>=2014) & (data['Season']<=2017)]
-
-#features = ['MPtsScDiff','MPtsTkDiff','WratioDiff']
-features = ['MPtsScDiff','MPtsTkDiff','WdeltaDiff']
-#features = ['MPtsScDiff','MPtsTkDiff']
-#features = ['WratioDiff']
-#features = ['WdeltaDiff']
 
 # test each season based on other seasons
 vals = []
@@ -173,12 +154,23 @@ for year in years:
     X_test = test[features]
     y_test = test['Result']
 
-    logreg = LogisticRegression()
+    estimator = LogisticRegression()
     params = {'C': np.logspace(start=-5, stop=3, num=9)}
-    clf = GridSearchCV(logreg, params, cv=10, scoring='neg_log_loss', refit=True)
+    clf = GridSearchCV(estimator, params, cv=10, scoring='neg_log_loss', refit=True)
     clf.fit(X_train, y_train)
-
     y_pred = clf.predict_proba(X_test)[:,1]
-    print("["+str(year)+"] score:", val_score(y_pred,y_test))
-    vals.append(val_score(y_pred,y_test))
+    
+    #estimator = Ridge(alpha=0)
+    #estimator.fit(X_train, y_train)
+    #y_pred = estimator.predict(X_test)
+    #y_pred = np.clip(y_pred,0.001,0.999)
+    
+    print("["+str(year)+"] score:", val_score(y_test,y_pred))
+    vals.append(val_score(y_test,y_pred))
+    plt.scatter(X_test['SeedDiff'],y_pred, color='blue', label='pred')
+    plt.scatter(X_test['SeedDiff'],y_test, color='green', label='result')
+    plt.legend(loc='best', shadow=False, scatterpoints=1)
+    plt.title('preds')
+    plt.figure()
+
 print("[All] score:", 1/4*sum(vals))
