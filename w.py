@@ -1,375 +1,125 @@
-# todo : add sort of season performance history per team instead of mean 
-#        combine model trained on tourney and model trained on regseason
-#        ensemble, blend, stack...
-
-# Remarks : trees works ok for 2014 2015 but bad for 2016 2017
-#           SVM also...
-
-
-#%%
 import numpy as np
+import itertools
 import pandas as pd
 import matplotlib.pyplot as plt
-from sklearn.utils import shuffle
-from sklearn.preprocessing import StandardScaler, MinMaxScaler, MaxAbsScaler
-from sklearn.decomposition import PCA
+from data_preprocessing import preprocess_data, make_sub
+from models import log_loss, better_conf, build_train_test, cross_train_predict, stacking_train_predict
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.model_selection import GridSearchCV
-from sklearn.linear_model import LogisticRegression, Ridge
-from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier, GradientBoostingClassifier, AdaBoostClassifier
-from sklearn.svm import SVC
 
-# --------------------------------- Load data ---------------------------------
-cities = pd.read_csv('./data_w/WCities.csv')
-gamecities = pd.read_csv('./data_w/WGameCities.csv')
-tourney = pd.read_csv('./data_w/WNCAATourneyCompactResults.csv')
-seeds = pd.read_csv('./data_w/WNCAATourneySeeds.csv')
-slots = pd.read_csv('./data_w/WNCAATourneySlots.csv')
-regseason = pd.read_csv('./data_w/WRegularSeasonCompactResults.csv')
-seasons = pd.read_csv('./data_w/WSeasons.csv')
-teamspellings = pd.read_csv('./data_w/WTeamSpellings.csv', engine='python')
-teams = pd.read_csv('./data_w/WTeams.csv')
-sub = pd.read_csv('./data_w/WSampleSubmissionStage1.csv')
+seasons = np.arange(1985,2019,1)
+tourney, regseason, sub = preprocess_data(seasons)
 
+# tourney columns:
+# - unusable:
+#   'Season', 'DayNum', 'T1ID', 'T2ID', 'T1PtsF', 'T2PtsF', 'T1PtsA', 'T2PtsA', 'T2Result', 'WDeltaRatio'
+# - usable but meh: 
+#   'NumOT', 'T1Games', 'T2Games', 'GamesDiff', 'GamesRatio', 'RatingRatio'
+# - usable:
+#   'T1Seed', 'T2Seed', 'SeedDiff', 'SeedRatio', 'T1Loc',
+#   'T1Rating', 'T1PtsFor', 'T1PtsAgainst', 'T1PtsDelta', 'T1WRatio', 'T1WDelta', 'T1WPyt', 'T1WWRatio', 
+#   'T2Rating', 'T2PtsFor', 'T2PtsAgainst', 'T2PtsDelta', 'T2WRatio', 'T2WDelta', 'T2WPyt', 'T2WWRatio', 
+#   'RatingDiff', 'PtsForDiff','PtsForRatio', 'PtsAgainstDiff', 'PtsAgainstRatio', 'PtsDeltaDiff', 'PtsDeltaRatio',
+#   'WRatioDiff', 'WRatioRatio', 'WDeltaDiff', 'WPytDiff', 'WPytRatio',
+#   'WWRatioDiff', 'WWRatioRatio'
+# - label:
+#   'T1Result'
 
-# ----------------------------- Validation metric -----------------------------
-def val_score(y_true, y_pred):
-    return -(y_true*np.log(y_pred)+(1-y_true)*np.log(1-y_pred)).mean()
+def predict(tourney, train_seasons, test_seasons, sub=None):
+    train_preds = pd.DataFrame()
+    test_preds = pd.DataFrame()
 
-
-# ----------------------------------- Ballzy ----------------------------------
-def better_conf(x, c=1):
-    ''' c > 1 -> increase confidence of result
-        c < 1 -> decrease ...
-    '''
-    if x == 0:
-        return 0
-    return 1 / (1 + (-1 + 1 / x)**c)
-    #return 1/2 + np.arctan(c*np.tan(np.pi*(x-1/2)))/np.pi
-
-
-# --------------------------------- Formating ---------------------------------
-# format tourney and regseason results
-# switch from WTeam / LTeam to sub format T1ID < T2ID
-def format_results(df):
-    df['Result'] = 1
-    for i, row in df.iterrows():
-        if row['WTeamID'] > row['LTeamID']:
-            df.set_value(i, 'WTeamID', row['LTeamID'])
-            df.set_value(i, 'LTeamID', row['WTeamID'])
-            df.set_value(i, 'Result', 0)
-            df.set_value(i, 'WScore', row['LScore'])
-            df.set_value(i, 'LScore', row['WScore'])
-            if row['WLoc'] == 'H':
-                df.set_value(i, 'WLoc', 'A')
-            if row['WLoc'] == 'A':
-                df.set_value(i, 'WLoc', 'H')
-    df.rename(columns={'WTeamID':'T1ID','LTeamID':'T2ID'}, inplace=True)
-    df.rename(columns={'WScore':'T1Score','LScore':'T2Score'}, inplace=True)
-    df.rename(columns={'WLoc':'T1Loc'}, inplace=True)
-
-format_results(tourney)
-format_results(regseason)
-
-# merge seeds & tourney results
-def seed_to_int(seed):
-    s_int = int(seed[1:3])
-    return s_int
-
-seeds['Seed'] = seeds['Seed'].apply(seed_to_int)
-t1seeds = seeds.rename(columns={'TeamID':'T1ID', 'Seed':'T1Seed'})
-t2seeds = seeds.rename(columns={'TeamID':'T2ID', 'Seed':'T2Seed'})
-tourney = pd.merge(left=tourney, right=t1seeds, how='left', on=['Season', 'T1ID'])
-tourney = pd.merge(left=tourney, right=t2seeds, how='left', on=['Season', 'T2ID'])
-tourney['SeedDiff'] = -(tourney['T1Seed'] - tourney['T2Seed'])
-
-# extract stats from reg season
-# pts scored/taken ; w/l ...
-t1stats = regseason.groupby(['Season','T1ID'])['T1Score'].sum().reset_index()
-t1stats.rename(columns={'T1ID':'TeamID','T1Score':'T1PtsSc'}, inplace = True)
-t1stats['T1PtsTk'] = regseason.groupby(['Season','T1ID'])['T2Score'].sum().reset_index()['T2Score']
-t1stats['T1ct'] = regseason.groupby(['Season','T1ID'])['T1Score'].count().reset_index()['T1Score']
-t1stats['T1Wins'] = regseason.groupby(['Season','T1ID'])['Result'].sum().reset_index()['Result']
-
-t2stats = regseason.groupby(['Season','T2ID'])['T2Score'].sum().reset_index()
-t2stats.rename(columns={'T2ID':'TeamID','T2Score':'T2PtsSc'}, inplace = True)
-t2stats['T2PtsTk'] = regseason.groupby(['Season','T2ID'])['T1Score'].sum().reset_index()['T1Score']
-t2stats['T2ct'] = regseason.groupby(['Season','T2ID'])['T2Score'].count().reset_index()['T2Score']
-t2stats['T2Wins'] = regseason.groupby(['Season','T2ID'])['Result'].sum().reset_index()['Result']
-t2stats['T2Wins'] = t2stats['T2ct'] - t2stats['T2Wins']
-
-stats = pd.merge(left=t1stats, right=t2stats, how='outer', on=['Season', 'TeamID'])
-stats.fillna(0, inplace=True)
-
-stats['MPtsSc'] = (stats['T1PtsSc'] + stats['T2PtsSc']) / (stats['T1ct'] + stats['T2ct'])
-stats['MPtsTk'] = (stats['T1PtsTk'] + stats['T2PtsTk']) / (stats['T1ct'] + stats['T2ct'])
-stats['MdeltaPts'] = stats['MPtsSc'] - stats['MPtsTk']
-stats['Wratio'] = (stats['T1Wins'] + stats['T2Wins']) / (stats['T1ct'] + stats['T2ct'])
-stats['Wdelta'] = 2*(stats['T1Wins'] + stats['T2Wins']) - (stats['T1ct'] + stats['T2ct'])
-stats.drop(['T1PtsSc','T1PtsTk','T2PtsSc','T2PtsTk','T1ct','T2ct','T1Wins','T2Wins'], axis=1, inplace=True)
-
-# merge team stats with tourney & regseason
-stats_list = ['MPtsSc','MPtsTk','MdeltaPts','Wratio','Wdelta']
-t1stats = stats.rename(columns=dict({'TeamID':'T1ID'}, **{stat:'T1'+stat for stat in stats_list}))
-t2stats = stats.rename(columns=dict({'TeamID':'T2ID'}, **{stat:'T2'+stat for stat in stats_list}))
-
-tourney = pd.merge(left=tourney, right=t1stats, how='left', on=['Season', 'T1ID'])
-tourney = pd.merge(left=tourney, right=t2stats, how='left', on=['Season', 'T2ID'])
-
-for stat in stats_list:
-    tourney[stat+'Diff'] = tourney['T1'+stat] - tourney['T2'+stat]
-
-regseason = pd.merge(left=regseason, right=t1stats, how='left', on=['Season', 'T1ID'])
-regseason = pd.merge(left=regseason, right=t2stats, how='left', on=['Season', 'T2ID'])
-
-for stat in stats_list:
-    regseason[stat+'Diff'] = regseason['T1'+stat] - regseason['T2'+stat]
-
-# Extract weighted win ratio and merge
-regseason['T1WResult'] = regseason['Result'] * ((1+regseason['T2Wratio']) / (1+regseason['T1Wratio'])) + (1 - regseason['Result']) * ((1+regseason['T2Wratio']) / (1+regseason['T1Wratio']) - 1)
-regseason['T2WResult'] = (1 - regseason['Result']) * ((1+regseason['T1Wratio']) / (1+regseason['T2Wratio'])) + regseason['Result'] * ((1+regseason['T1Wratio']) / (1+regseason['T2Wratio']) - 1)
-
-t1stats = regseason.groupby(['Season','T1ID'])['T1WResult'].sum().reset_index()
-t1stats.rename(columns={'T1ID':'TeamID'}, inplace = True)
-t1stats['T1ct'] = regseason.groupby(['Season','T1ID'])['T1WResult'].count().reset_index()['T1WResult']
-
-t2stats = regseason.groupby(['Season','T2ID'])['T2WResult'].sum().reset_index()
-t2stats.rename(columns={'T2ID':'TeamID'}, inplace = True)
-t2stats['T2ct'] = regseason.groupby(['Season','T2ID'])['T2WResult'].count().reset_index()['T2WResult']
-
-stats = pd.merge(left=t1stats, right=t2stats, how='outer', on=['Season', 'TeamID'])
-stats.fillna(0, inplace=True)
-
-stats['WWratio'] = (stats['T1WResult'] + stats['T2WResult']) / (stats['T1ct'] + stats['T2ct'])
-stats.drop(['T1WResult','T2WResult','T1ct','T2ct'], axis=1, inplace=True)
-
-stats_list = ['WWratio']
-t1stats = stats.rename(columns=dict({'TeamID':'T1ID'}, **{stat:'T1'+stat for stat in stats_list}))
-t2stats = stats.rename(columns=dict({'TeamID':'T2ID'}, **{stat:'T2'+stat for stat in stats_list}))
-
-tourney = pd.merge(left=tourney, right=t1stats, how='left', on=['Season', 'T1ID'])
-tourney = pd.merge(left=tourney, right=t2stats, how='left', on=['Season', 'T2ID'])
-
-for stat in stats_list:
-    tourney[stat+'Diff'] = tourney['T1'+stat] - tourney['T2'+stat]
-
-regseason = pd.merge(left=regseason, right=t1stats, how='left', on=['Season', 'T1ID'])
-regseason = pd.merge(left=regseason, right=t2stats, how='left', on=['Season', 'T2ID'])
-
-for stat in stats_list:
-    regseason[stat+'Diff'] = regseason['T1'+stat] - regseason['T2'+stat]
-
-#%%
-print(regseason.count())
-
-#%% --------------------------------- Obs -------------------------------------
-#tourney.plot(x='SeedDiff', y='Result', kind='scatter')
-#plt.show()
-pca = PCA(n_components=2)
-features = ['MPtsScDiff','MPtsTkDiff','MdeltaPtsDiff','WratioDiff','WdeltaDiff','SeedDiff','WWratioDiff']
-X = tourney.loc[:,features]
-y = tourney['Result']
-X.loc[:,features] = StandardScaler().fit_transform(X[features])
-X_r = pca.fit_transform(X)
-for color, i, target_name in zip(['green','red'], [0, 1], ['win','loss']):
-    plt.scatter(X_r[y == i, 0], X_r[y == i, 1], color=color, label=target_name)
-plt.legend(loc='best', shadow=False, scatterpoints=1)
-plt.title('PCA')
-plt.figure()
-
-#%%
-pca = PCA(n_components=2)
-features = ['MPtsScDiff','MPtsTkDiff','MdeltaPtsDiff','WratioDiff','WdeltaDiff','SeedDiff','WWratioDiff']
-data = tourney[tourney['Season']==1999]
-X = data.loc[:,features]
-y = data['Result']
-X.loc[:,features] = StandardScaler().fit_transform(X[features])
-X_r = pca.fit_transform(X)
-for color, i, target_name in zip(['green','red'], [0, 1], ['win','loss']):
-    plt.scatter(X_r[y == i, 0], X_r[y == i, 1], color=color, label=target_name)
-plt.legend(loc='best', shadow=False, scatterpoints=1)
-plt.title('PCA')
-plt.figure()
-
-#%%
-pca = PCA(n_components=2)
-features = ['MPtsScDiff','MPtsTkDiff','MdeltaPtsDiff','WratioDiff','WdeltaDiff','WWratioDiff']
-X = regseason.loc[:,features]
-y = regseason['Result']
-X.loc[:,features] = StandardScaler().fit_transform(X[features])
-#X = MinMaxScaler().fit_transform(X)
-#X = MaxAbsScaler().fit_transform(X)
-X_r = pca.fit_transform(X)
-for color, i, target_name in zip(['green','red'], [0, 1], ['win','loss']):
-    plt.scatter(X_r[y == i, 0], X_r[y == i, 1], color=color, label=target_name)
-plt.legend(loc='best', shadow=False, scatterpoints=1)
-plt.title('PCA')
-plt.figure()
-
-#%%
-pca = PCA(n_components=2)
-features = ['MPtsScDiff','MPtsTkDiff','MdeltaPtsDiff','WratioDiff','WdeltaDiff','WWratioDiff']
-data = regseason[regseason['Season']==2017]
-X = data.loc[:,features]
-y = data['Result']
-X.loc[:,features] = StandardScaler().fit_transform(X[features])
-#X = MinMaxScaler().fit_transform(X)
-#X = MaxAbsScaler().fit_transform(X)
-X_r = pca.fit_transform(X)
-for color, i, target_name in zip(['green','red'], [0, 1], ['win','loss']):
-    plt.scatter(X_r[y == i, 0], X_r[y == i, 1], color=color, label=target_name)
-plt.legend(loc='best', shadow=False, scatterpoints=1)
-plt.title('PCA')
-plt.figure()
-
-
-# ---------------------------------- Model 1 ----------------------------------
-#%% trained on tourney results 
-# based on prev regular season stats + seed diff.
-print("trained on tourney")
-
-features = ['MPtsScDiff','MPtsTkDiff','MdeltaPtsDiff','WratioDiff','WdeltaDiff','SeedDiff','WWratioDiff']
-
-def get_train_test_tourney(features, year):
-    data = tourney.loc[:,['Season','Result']+features]
-    sym_data = data.copy()
-    for feature in features:
-        sym_data[feature] *= -1
-    sym_data['Result'] = 1 - sym_data['Result']
-    train = pd.concat([data, sym_data]).reset_index(drop=True)
-    train = train[train['Season']!=year]
-    test = data.copy()
-    test = test[test['Season']==year]
-    scaler = StandardScaler()
-    train.loc[:,features] = scaler.fit_transform(train[features])
-    test.loc[:,features] = scaler.transform(test[features])
-
-    X_train = train.drop(['Result'], axis=1)
-    y_train = train['Result']
-    X_test = test.drop(['Result'], axis=1)
-    y_test = test['Result']
-    return X_train, X_test, y_train, y_test
-
-vals = []
-years = [2014,2015,2016,2017]
-for year in years:
-    X_train, X_test, y_train, y_test = get_train_test_tourney(features, year)
+    # Logistic Regression
+    features = ['RatingDiff', 'SeedDiff', 'PtsAgainstDiff', 'WRatioDiff', 'WDeltaDiff', 'WWRatioDiff']
+    X_train, X_test, y_train, y_test = build_train_test(tourney, train_seasons, test_seasons, features, sub)
+    logReg = LogisticRegression(C=0.55)
+    train_pred, test_pred = cross_train_predict(logReg, 2, X_train, y_train, X_test)
+    train_preds['logReg'] = train_pred
+    test_preds['logReg'] = test_pred
     
-    estimator = LogisticRegression()
-    params = {'C': np.logspace(start=-5, stop=3, num=9)}
-    clf = GridSearchCV(estimator, params, cv=10, scoring='neg_log_loss', refit=True)
-    clf.fit(X_train, y_train)
-    y_pred = clf.predict_proba(X_test)[:,1]
+    # GBR
+    features = ['RatingDiff', 'SeedDiff']
+    X_train, X_test, y_train, y_test = build_train_test(tourney, train_seasons, test_seasons, features, sub)
+    gbr = GradientBoostingClassifier(n_estimators=100, learning_rate=0.05, max_features=0.8, subsample=1)
+    train_pred, test_pred = cross_train_predict(gbr, 20, X_train, y_train, X_test)
+    train_preds['gbr'] = train_pred
+    test_preds['gbr'] = test_pred
+
+    # NN1
+    features = ['RatingDiff', 'SeedDiff', 'PtsAgainstDiff', 'WRatioDiff', 'WDeltaDiff', 'WWRatioDiff']
+    X_train, X_test, y_train, y_test = build_train_test(tourney, train_seasons, test_seasons, features, sub)
+    train_pred, test_pred = cross_train_predict('nn1', 20, X_train, y_train, X_test)
+    train_preds['nn1'] = train_pred
+    test_preds['nn1'] = test_pred
+
+    # NN2
+    #features = ['RatingDiff', 'SeedDiff', 'PtsAgainstDiff', 'WRatioDiff', 'WDeltaDiff', 'WWRatioDiff']
+    #X_train, X_test, y_train, y_test = build_train_test(tourney, train_seasons, test_seasons, features, sub)
+    #train_pred, test_pred = cross_train_predict('nn2', 20, X_train, y_train, X_test)
+    #train_preds['nn2'] = train_pred
+    #test_preds['nn2'] = test_pred
+
+    # Stacking
+    y_pred = stacking_train_predict(train_preds, y_train, test_preds, y_test, 'nn')
+
+    y_pred = pd.Series(y_pred).apply(lambda x: better_conf(x, 1.2))
+
+    y_pred = y_pred.values
+
+    if sub is None:
+        print('logReg | train:', log_loss(y_train, train_preds['logReg']),'| test:', log_loss(y_test, test_preds['logReg'].values))
+        print('gbr | train:', log_loss(y_train, train_preds['gbr']),'| test:', log_loss(y_test, test_preds['gbr'].values))
+        print('nn1 | train:', log_loss(y_train, train_preds['nn1']),'| test:', log_loss(y_test, test_preds['nn1'].values))
+    #    print('nn2 | train:', log_loss(y_train, train_preds['nn2']),'| test:', log_loss(y_test, test_preds['nn2'].values))
+    else:
+        print('logReg | train:', log_loss(y_train, train_preds['logReg']))
+        print('gbr | train:', log_loss(y_train, train_preds['gbr']))
+        print('nn1 | train:', log_loss(y_train, train_preds['nn1']))
+    #    print('nn2 | train:', log_loss(y_train, train_preds['nn2']))
+
+    if sub is not None:
+        make_sub(sub, y_pred)
+        return 'done'
+
+    else:
+        return log_loss(y_test, y_pred)
     
-    #estimator = Ridge(alpha=0)
-    #estimator.fit(X_train, y_train)
-    #y_pred = estimator.predict(X_test)
-    #y_pred = np.clip(y_pred,0.001,0.999)
-    
-    #estimator = GradientBoostingClassifier(n_estimators=50)
-    #params = {'max_depth':np.arange(1,4,1), 'min_samples_split':np.arange(2,12,2), 'learning_rate':np.arange(0.16,0.24,0.02)}
-    #clf = GridSearchCV(estimator, params, cv=10, scoring='neg_log_loss', refit=True)
-    #clf.fit(X_train, y_train)
-    #print(clf.best_params_)
-    #y_pred = clf.predict_proba(X_test)[:,1]
-    #y_pred = np.clip(y_pred,0.01,0.99)
 
-    #estimator = SVC(C=0.01, kernel='sigmoid', gamma='auto', shrinking=True, probability=True, cache_size=1000)
-    #params = {'gamma':np.logspace(start=-2, stop=2, num=5),'coef0':np.logspace(start=-2, stop=2, num=5)}
-    #clf = GridSearchCV(estimator, params, cv=10, scoring='neg_log_loss', refit=True)
-    #clf.fit(X_train, y_train)
-    #print(clf.best_params_)
-    #y_pred = clf.predict_proba(X_test)[:,1]
-    #y_pred = np.clip(y_pred,0.01,0.99)
-
-    print("["+str(year)+"] score:", val_score(y_test,y_pred))
-
-    min_val = 1
-    best_c = 0
-    for c in np.arange(0.5,2,0.01):
-        f = np.vectorize(lambda x: better_conf(x,c))
-        y = f(y_pred)
-        if val_score(y_test,y) < min_val:
-            min_val = val_score(y_test,y)
-            best_c = c
-    print("["+str(year)+"] c:", best_c, "|", "score:", min_val)
-    
-    vals.append(val_score(y_test,y_pred))
-print("[All] score:", 1/4*sum(vals))
+test_seasons = [2018]
+#train_seasons = list(set(seasons)-set(test_seasons))
+train_seasons = [1989,1992,1993,1994,1995,1996,1999,2000,2004,2005,2007,2008,2009,2015,2017]
+print(predict(tourney, train_seasons, test_seasons, sub))
 
 
-# ---------------------------------- Model 2 ----------------------------------
-#%% trained on regseason results 
-# based on regular season stats
-print("trained on regseason")
 
-features = ['MPtsScDiff','MPtsTkDiff','MdeltaPtsDiff','WratioDiff','WdeltaDiff','WWratioDiff']
 
-def get_train_test_regseason(features, year):
-    data = regseason.loc[:,['Season','Result','T1Loc']+features]
-    sym_data = data.copy()
-    for feature in features:
-        sym_data[feature] *= -1
-    sym_data['T1Loc'].apply(lambda x: 'H' if x=='A' else 'A' if x=='H' else x)
-    sym_data['Result'] = 1 - sym_data['Result']
-    train = pd.concat([data, sym_data]).reset_index(drop=True)
-    train = train[train['Season']!=year]
-    train = pd.get_dummies(train, columns=['T1Loc'], prefix='', prefix_sep='')
-    test = tourney.loc[:,['Season','Result','T1Loc']+features]
-    test = pd.get_dummies(test, columns=['T1Loc'], prefix='', prefix_sep='')
-    test = test[test['Season']==year]
-    scaler = StandardScaler()
-    train.loc[:,features] = scaler.fit_transform(train[features])
-    test.loc[:,features] = scaler.transform(test[features])
+def sub_lists(l, min_s=1, max_s=None):
+    subs = []
+    max_s = len(l) if max_s is None else min(max_s, len(l))
+    min_s = max(min_s, 1)
+    for size in np.arange(min_s,max_s+1,1):
+        subs = subs + [list(x) for x in set(itertools.combinations(l, size))]
+    return subs
 
-    X_train = train.drop(['Result'], axis=1)
-    y_train = train['Result']
-    X_test = test.drop(['Result'], axis=1)
-    y_test = test['Result']
-    return X_train, X_test, y_train, y_test
+def find_best_features(data, train_seasons, test_seasons, features):
+    best_fs = None
+    best_val = np.float('inf')
+    for fs in sub_lists(features):
+        X_train, X_test, y_train, y_test = build_train_test(data, train_seasons, test_seasons, fs)
+        train_pred, test_pred = cross_train_predict('nn1', 10, X_train, y_train, X_test, y_test)
+        val = log_loss(y_train, train_pred.values)
+        if val < best_val:
+            best_val = val
+            best_fs = fs
+    return best_fs, best_val
 
-vals = []
-years = [2014,2015,2016,2017]
-for year in years:
-    X_train, X_test, y_train, y_test = get_train_test_regseason(features, year)
-    
-    estimator = LogisticRegression()
-    params = {'C': np.logspace(start=-5, stop=3, num=9)}
-    clf = GridSearchCV(estimator, params, cv=10, scoring='neg_log_loss', refit=True)
-    clf.fit(X_train, y_train)
-    y_pred = clf.predict_proba(X_test)[:,1]
-    
-    #estimator = Ridge(alpha=0)
-    #estimator.fit(X_train, y_train)
-    #y_pred = estimator.predict(X_test)
-    #y_pred = np.clip(y_pred,0.001,0.999)
-    
-    #estimator = GradientBoostingClassifier(n_estimators=50)
-    #params = {'max_depth':np.arange(1,4,1), 'min_samples_split':np.arange(2,12,2), 'learning_rate':np.arange(0.16,0.24,0.02)}
-    #clf = GridSearchCV(estimator, params, cv=10, scoring='neg_log_loss', refit=True)
-    #clf.fit(X_train, y_train)
-    #print(clf.best_params_)
-    #y_pred = clf.predict_proba(X_test)[:,1]
-    #y_pred = np.clip(y_pred,0.01,0.99)
 
-    #estimator = SVC(C=0.01, kernel='sigmoid', gamma='auto', shrinking=True, probability=True, cache_size=1000)
-    #params = {'gamma':np.logspace(start=-2, stop=2, num=5),'coef0':np.logspace(start=-2, stop=2, num=5)}
-    #clf = GridSearchCV(estimator, params, cv=10, scoring='neg_log_loss', refit=True)
-    #clf.fit(X_train, y_train)
-    #print(clf.best_params_)
-    #y_pred = clf.predict_proba(X_test)[:,1]
-    #y_pred = np.clip(y_pred,0.01,0.99)
+#test_seasons = [2014,2015,2016,2017]
+#train_seasons = seasons
+#features = ['RatingDiff', 'SeedDiff', 'PtsAgainstDiff', 'PtsDeltaDiff', 'WRatioDiff', 'WDeltaDiff', 'WPytDiff', 'WWRatioDiff', 'FHRatingDiff']
+#best_fs, best_val = find_best_features(tourney, train_seasons, test_seasons, features)
+#print(best_fs)
+#print(best_val)
+#print(predict(tourney, train_seasons, test_seasons, features))
 
-    print("["+str(year)+"] score:", val_score(y_test,y_pred))
-
-    min_val = 1
-    best_c = 0
-    for c in np.arange(0.5,2,0.01):
-        f = np.vectorize(lambda x: better_conf(x,c))
-        y = f(y_pred)
-        if val_score(y_test,y) < min_val:
-            min_val = val_score(y_test,y)
-            best_c = c
-    print("["+str(year)+"] c:", best_c, "|", "score:", min_val)
-    
-    vals.append(val_score(y_test,y_pred))
-print("[All] score:", 1/4*sum(vals))
